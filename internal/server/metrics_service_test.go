@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"dash0.com/otlp-metric-store-backend/internal/ingest"
+	"dash0.com/otlp-metric-store-backend/internal/mapping"
 	. "dash0.com/otlp-metric-store-backend/internal/otlptest"
 	"dash0.com/otlp-metric-store-backend/internal/storage"
 )
@@ -42,7 +43,7 @@ func (f *fakeWriter) Write(_ context.Context, s []storage.SeriesRow, p []storage
 // client serves a MetricsService on an in-memory connection.
 func client(t *testing.T, w Writer) colmetricspb.MetricsServiceClient {
 	t.Helper()
-	svc, err := NewMetricsService(w, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := NewMetricsService(w, limits, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +63,10 @@ func client(t *testing.T, w Writer) colmetricspb.MetricsServiceClient {
 	return colmetricspb.NewMetricsServiceClient(conn)
 }
 
-var now = uint64(time.Now().UnixNano())
+var (
+	now    = uint64(time.Now().UnixNano())
+	limits = mapping.TimeLimits{MaxAge: 24 * time.Hour, MaxClockSkew: time.Hour}
+)
 
 func request(metrics ...*metricspb.Metric) *colmetricspb.ExportMetricsServiceRequest {
 	return &colmetricspb.ExportMetricsServiceRequest{
@@ -102,6 +106,27 @@ func TestExportReportsRejectedDataPointsAsPartialSuccess(t *testing.T) {
 	}
 	if len(w.points) != 1 {
 		t.Fatalf("the valid gauge must still be stored, stored %d points", len(w.points))
+	}
+}
+
+func TestExportRejectsDataPointsOutsideTheTimeLimits(t *testing.T) {
+	w := &fakeWriter{}
+	tooOld := now - uint64(25*time.Hour)
+	inFuture := now + uint64(2*time.Hour)
+	resp, err := client(t, w).Export(context.Background(), request(
+		Gauge("cpu.utilization", "1", Point(now, 0.5), Point(tooOld, 0.25), Point(inFuture, 0.75)),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := resp.GetPartialSuccess()
+	if ps.GetRejectedDataPoints() != 2 ||
+		!strings.Contains(ps.GetErrorMessage(), "timestamp_too_old=1 (before ") ||
+		!strings.Contains(ps.GetErrorMessage(), "timestamp_in_future=1 (after ") {
+		t.Fatalf("got partial success %v, want one data point too old and one in the future", ps)
+	}
+	if len(w.points) != 1 {
+		t.Fatalf("the data point within the limits must still be stored, stored %d points", len(w.points))
 	}
 }
 

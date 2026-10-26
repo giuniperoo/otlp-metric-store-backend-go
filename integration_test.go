@@ -106,9 +106,10 @@ type testApp struct {
 	conn   driver.Conn
 }
 
-func startApp(t *testing.T, ch storage.ClickHouseConfig) *testApp {
+// startApp starts the service with the default configuration, changed by the given flags.
+func startApp(t *testing.T, ch storage.ClickHouseConfig, flags ...string) *testApp {
 	t.Helper()
-	cfg, err := loadConfig(nil, func(string) string { return "" })
+	cfg, err := loadConfig(flags, func(string) string { return "" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +288,52 @@ func TestUnsupportedMetricTypesArePartiallyRejected(t *testing.T) {
 	}
 	if n := a.count(t, "SELECT count() FROM otel_metrics_number_points"); n != 1 {
 		t.Fatalf("stored %d data points, want 1", n)
+	}
+}
+
+// TestDataPointsOutsideTheAcceptedWindowArePartiallyRejected sends what used to fail or get
+// lost: data points on more than 100 days, which ClickHouse refuses to insert in one batch
+// (too many partitions), and a data point after 2149, which the Date column cannot hold.
+func TestDataPointsOutsideTheAcceptedWindowArePartiallyRejected(t *testing.T) {
+	a := startApp(t, testDatabase(t)) // defaults: maxDataPointAge 7 days, maxClockSkew 1 hour
+	now := time.Now()
+	var points []*metricspb.NumberDataPoint
+	for day := range 101 {
+		points = append(points, Point(uint64(now.Add(-time.Duration(day)*24*time.Hour).UnixNano()), float64(day)))
+	}
+	points = append(points, Point(uint64(time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()), 1))
+
+	ps := a.export(t, Resource(webHost, Gauge("queue.depth", "1", points...))).GetPartialSuccess()
+	// Days 0 to 6 are within 7 days; day 7 is just older than the service's own now minus 7 days.
+	if ps.GetRejectedDataPoints() != 95 ||
+		!strings.Contains(ps.GetErrorMessage(), "timestamp_too_old=94") ||
+		!strings.Contains(ps.GetErrorMessage(), "timestamp_in_future=1") {
+		t.Fatalf("got partial success %v, want 94 data points too old and 1 in the future", ps)
+	}
+	if n := a.count(t, "SELECT count() FROM otel_metrics_number_points"); n != 7 {
+		t.Errorf("stored %d data points, want 7", n)
+	}
+	if n := a.count(t, "SELECT count() FROM otel_metrics_series"); n != 7 {
+		t.Errorf("stored %d series rows, want 7 (one per day)", n)
+	}
+}
+
+// TestOldestAcceptedDataPointIsKeptByTheTTL checks the lower bound of the window against the
+// TTL: a data point older than the retention would be acknowledged and then deleted at once.
+func TestOldestAcceptedDataPointIsKeptByTheTTL(t *testing.T) {
+	a := startApp(t, testDatabase(t), "-retentionDays=2")
+	yesterday := time.Now().UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour)
+	oldest := uint64(yesterday.UnixNano())
+
+	ps := a.export(t, Resource(webHost, Gauge("queue.depth", "1", Point(oldest, 1), Point(oldest-1, 2)))).GetPartialSuccess()
+	if ps.GetRejectedDataPoints() != 1 || !strings.Contains(ps.GetErrorMessage(), "timestamp_too_old=1") {
+		t.Fatalf("got partial success %v, want the data point before yesterday rejected", ps)
+	}
+	if n := a.count(t, "SELECT count() FROM otel_metrics_number_points"); n != 1 {
+		t.Errorf("%d data points visible, want 1: the TTL deleted an accepted data point", n)
+	}
+	if n := a.count(t, "SELECT count() FROM otel_metrics_series"); n != 1 {
+		t.Errorf("%d series rows visible, want 1: the TTL deleted an accepted series row", n)
 	}
 }
 

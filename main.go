@@ -113,7 +113,7 @@ func newApp(ctx context.Context, cfg config, logger *slog.Logger) (*app, error) 
 	if err != nil {
 		return nil, errors.Join(err, store.Close())
 	}
-	metricsService, err := server.NewMetricsService(writer, cache, logger)
+	metricsService, err := server.NewMetricsService(writer, cfg.TimeLimits, cache, logger)
 	if err != nil {
 		return nil, errors.Join(err, writer.Close(ctx), store.Close())
 	}

@@ -33,18 +33,23 @@ type MetricsService struct {
 	colmetricspb.UnimplementedMetricsServiceServer
 
 	writer Writer
+	limits mapping.TimeLimits
 	known  mapping.KnownSeries
 	log    *slog.Logger
 	tel    instruments
 }
 
-// NewMetricsService returns a MetricsService. known may be nil to disable the series cache.
-func NewMetricsService(writer Writer, known mapping.KnownSeries, log *slog.Logger) (*MetricsService, error) {
+// NewMetricsService returns a MetricsService that accepts data points within limits. known may
+// be nil to disable the series cache.
+func NewMetricsService(writer Writer, limits mapping.TimeLimits, known mapping.KnownSeries, log *slog.Logger) (*MetricsService, error) {
+	if err := limits.Validate(); err != nil {
+		return nil, err
+	}
 	tel, err := newInstruments()
 	if err != nil {
 		return nil, err
 	}
-	return &MetricsService{writer: writer, known: known, log: log, tel: tel}, nil
+	return &MetricsService{writer: writer, limits: limits, known: known, log: log, tel: tel}, nil
 }
 
 // retryDelay is the delay suggested to clients that are throttled or hit a storage error.
@@ -53,13 +58,14 @@ const retryDelay = time.Second
 // Export implements the OTLP MetricsService.
 //
 // Following the OTLP specification:
-//   - invalid or unsupported data points are dropped and reported in a partial success with
-//     the number of rejected data points and the reasons; the rest of the request is stored,
+//   - invalid or unsupported data points, and data points outside the accepted time window,
+//     are dropped and reported in a partial success with the number of rejected data points
+//     and the reasons; the rest of the request is stored,
 //   - when the service is overloaded or ClickHouse is unavailable, the whole request fails with
 //     UNAVAILABLE and a RetryInfo, which OTLP exporters retry with backoff,
 //   - a success response is only sent after the data points are stored.
 func (s *MetricsService) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
-	res := mapping.Map(req.GetResourceMetrics(), s.known)
+	res := mapping.Map(req.GetResourceMetrics(), s.limits.Window(time.Now()), s.known)
 
 	s.tel.metricsReceived.Add(ctx, int64(res.Metrics))
 	s.tel.pointsReceived.Add(ctx, int64(res.DataPoints))
