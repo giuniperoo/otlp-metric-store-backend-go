@@ -52,10 +52,10 @@ type pending struct {
 	dataPoint *metricspb.NumberDataPoint
 }
 
-// Map converts the resource metrics of an export request. Data points of gauges and sums are
-// accepted; other metric types and invalid data points are counted in Result.Rejected.
-// known may be nil, in which case every series is treated as new.
-func Map(resourceMetrics []*metricspb.ResourceMetrics, known KnownSeries) Result {
+// Map converts the resource metrics of an export request. Data points of gauges and sums with
+// a time in the accepted window are accepted; other metric types and invalid data points are
+// counted in Result.Rejected. known may be nil, in which case every series is treated as new.
+func Map(resourceMetrics []*metricspb.ResourceMetrics, accepted Window, known KnownSeries) Result {
 	h := hasherPool.Get().(*series.Hasher)
 	defer hasherPool.Put(h)
 
@@ -67,6 +67,7 @@ func Map(resourceMetrics []*metricspb.ResourceMetrics, known KnownSeries) Result
 		pendings = make([]pending, 0, capacity)
 		index    = make(map[series.Key]int, capacity)
 	)
+	res.Rejected.window = accepted
 	for _, rm := range resourceMetrics {
 		resourceHash := h.Resource(rm.GetResource().GetAttributes(), rm.GetSchemaUrl())
 		for _, sm := range rm.GetScopeMetrics() {
@@ -91,6 +92,14 @@ func Map(resourceMetrics []*metricspb.ResourceMetrics, known KnownSeries) Result
 					timeNano, startNano := dp.GetTimeUnixNano(), dp.GetStartTimeUnixNano()
 					if timeNano == 0 || timeNano > math.MaxInt64 || startNano > math.MaxInt64 {
 						res.Rejected.add(ReasonInvalidTimestamp, 1, "")
+						continue
+					}
+					if timeNano < accepted.From {
+						res.Rejected.add(ReasonTimestampTooOld, 1, "")
+						continue
+					}
+					if timeNano > accepted.To {
+						res.Rejected.add(ReasonTimestampInFuture, 1, "")
 						continue
 					}
 					value, ok := numberValue(dp)

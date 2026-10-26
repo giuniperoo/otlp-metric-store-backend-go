@@ -58,8 +58,9 @@ two commands (the service and `tools/loadgen`). Use `go run .` instead.
   `otel_metrics_sum` tables. Gauges and sums share the OTLP `NumberDataPoint`, so they share one
   data point table, and the metric type is recorded in the series table.
 - **Batching across requests**, backpressure, and acknowledgements only after data is stored.
-- **OTLP partial success** for invalid data points and unsupported metric types (histograms,
-  exponential histograms, summaries), reported with reasons instead of being dropped silently.
+- **OTLP partial success** for invalid data points, data points outside the accepted time
+  window, and unsupported metric types (histograms, exponential histograms, summaries),
+  reported with reasons instead of being dropped silently.
 - **The service's own telemetry**: metrics, traces and logs for every stage, exportable over
   OTLP (for example to Dash0).
 - **Production wiring**: configuration from environment variables, gRPC health service, gzip
@@ -88,6 +89,7 @@ These terms are used consistently in code, table names, logs and metric names.
 | **series row** | One row of the lookup table: a series on a UTC day on which it received data points. |
 | **batch** | The rows of many export requests that are inserted together. |
 | **flush** | Storing one batch: first its new series rows, then its data points. |
+| **accepted window** | The range of data point times that are stored, relative to the time of the request (see [Accepted time window](#accepted-time-window)). |
 | **rejected** | A data point that is not stored, reported back in the OTLP partial success with a **reason**. |
 
 ## Storage design
@@ -185,8 +187,17 @@ The task says data is always queried for a time range, with no other mandatory f
 |---|---|
 | [`points_of_metric.sql`](queries/points_of_metric.sql) | time range + metric name: series resolved in the lookup table first, then only those series read per hour |
 | [`data_points_per_metric.sql`](queries/data_points_per_metric.sql) | time range only |
-| [`series_of_host.sql`](queries/series_of_host.sql) | time range + resource attribute, lookup table only (bloom filter indexes on attribute keys and values) |
+| [`series_of_host.sql`](queries/series_of_host.sql) | time range + resource attribute, lookup table only, pruned by day (see the note below on the attribute indexes) |
 | [`increase_of_sums.sql`](queries/increase_of_sums.sql) | time range, cumulative monotonic sums |
+
+**The attribute indexes are not used through the series view.** The series table has bloom
+filter indexes on the keys and values of `ResourceAttributes` and `Attributes`, but
+`otel_metrics_series_in_range` ends in `LIMIT 1 BY SeriesId`, and ClickHouse can't push a
+filter written outside the view below a `LIMIT BY`. So `series_of_host.sql` prunes the series
+table by day, as the view requires, and then filters the series of those days. That is cheap
+at low cardinality. A query that reads `otel_metrics_series` directly, with a `Date` condition,
+does use the indexes (verified with `EXPLAIN indexes = 1` on 26.2). See
+[Trade-offs](#trade-offs-and-next-steps).
 
 ## Ingest path
 
@@ -226,6 +237,27 @@ The task says data is always queried for a time range, with no other mandatory f
   runs out of memory. A request is always admitted when nothing is pending, so an oversized
   request can't be rejected forever.
 
+### Accepted time window
+
+A data point is stored only if its time is in the **accepted window**: at most
+`maxDataPointAge` (7 days) in the past, at most `maxClockSkew` (1 hour) in the future, and on
+one of the last `retentionDays` UTC days, including today. Data points outside it are rejected
+with `timestamp_too_old` or `timestamp_in_future`. The window exists for two reasons:
+
+- **One client must not fail everyone's batch.** Both tables are partitioned by day, and
+  ClickHouse refuses an insert into more than 100 partitions (`max_partitions_per_insert_block`).
+  A batch merges the requests of many clients, so without a window a single client backfilling
+  a few months would fail the whole batch with `UNAVAILABLE`. Its retries would then fail every
+  later batch they joined. The window may span at most 90 days, which is checked at startup.
+- **Acknowledged data must not be lost.** A data point older than the retention would be
+  acknowledged and then deleted at once by the TTL. A data point after 2149 can't be held by
+  the `Date` column (the driver wraps it without an error), so it would be acknowledged and
+  lost too. Rejecting them reports the loss to the client instead of hiding it.
+
+The partial success message includes the window bound, for example
+`timestamp_too_old=94 (before 2026-10-19T11:34:28Z)`, so a client with a wrong clock can see
+the server's view of the time.
+
 ### Responses
 
 | Situation | Response |
@@ -236,7 +268,8 @@ The task says data is always queried for a time range, with no other mandatory f
 | client deadline passed before the batch was stored | `DEADLINE_EXCEEDED` (the data may still be stored; see at-least-once above) |
 
 Rejection reasons: `unsupported_metric_type`, `missing_metric_name`, `invalid_timestamp` (zero,
-or beyond what `DateTime64(9)` can hold), `missing_value`.
+or beyond what `DateTime64(9)` can hold), `timestamp_too_old` and `timestamp_in_future` (outside
+the [accepted window](#accepted-time-window)), `missing_value`.
 
 ## Operating it
 
@@ -254,7 +287,9 @@ environment variables.
 | `CLICKHOUSE_PASSWORD` | | environment variable only, so it doesn't show up in process listings |
 | `-clickhouseMaxOpenConns` | 10 | |
 | `-migrate` | `true` | create missing tables and views on startup and check existing tables |
-| `-retentionDays` | 30 | TTL for new tables; 0 keeps data forever |
+| `-retentionDays` | 30 | TTL for new tables; 0 keeps data forever. Data points older than the retention are rejected |
+| `-maxDataPointAge` | 168h | oldest accepted data point; see [Accepted time window](#accepted-time-window) |
+| `-maxClockSkew` | 1h | furthest accepted data point in the future; together with `maxDataPointAge` at most 90 days |
 | `-batchMaxDataPoints` | 100000 | |
 | `-batchMaxDelay` | 200ms | upper bound on the latency batching adds |
 | `-writeQueueSize` | 1000 | requests waiting for a batch before new ones get `UNAVAILABLE` |
@@ -316,10 +351,10 @@ missing columns, instead of every insert failing later.
 | | What it shows |
 |---|---|
 | `internal/series` tests | series IDs are deterministic, ignore attribute order, change with every identity field (all 15 cases), don't change with the description, match the stored maps for duplicate keys; the cache stays bounded and keeps active series |
-| `internal/mapping` tests | gauge and sum mapping, one series row per series and day, cached series skipped, resource changes create new series, every rejection reason counted |
+| `internal/mapping` tests | gauge and sum mapping, one series row per series and day, cached series skipped, resource changes create new series, every rejection reason counted, the accepted window and how the retention narrows it |
 | `internal/ingest` tests | series stored before data points, concurrent requests merged into one insert, full batches flushed without waiting, store errors reported to every waiting request and failed series not cached, backpressure by queue size and by pending data points, context deadlines, flush on close (run with `-race`) |
 | `internal/server` tests | partial success, status codes and `RetryInfo` per failure, internal errors not leaked to clients |
-| integration tests (`-tags integration`) | the full service against ClickHouse 26.2: migration (idempotent, detects incompatible tables, TTL), series written once despite repeated exports, idempotent across restarts, exact round trip of nanosecond timestamps, values and flags, partial success end to end, and **every documented query passing `force_index_by_date` + `force_primary_key`** |
+| integration tests (`-tags integration`) | the full service against ClickHouse 26.2: migration (idempotent, detects incompatible tables, TTL), series written once despite repeated exports, idempotent across restarts, exact round trip of nanosecond timestamps, values and flags, partial success end to end, a request spanning 101 days and a data point in 2200 partially rejected instead of failing or being lost, the oldest accepted data point kept by the TTL, and **every documented query passing `force_index_by_date` + `force_primary_key`** |
 
 ### Performance
 
@@ -370,6 +405,14 @@ This is worth reporting upstream.
 - **Schema evolution.** `CREATE TABLE IF NOT EXISTS` with a column check is enough for one
   version. Real changes (TTL, new columns) want versioned migrations (e.g. goose or
   golang-migrate).
+- **Attribute filters on the series table.** Through `otel_metrics_series_in_range`, attribute
+  filters run after `LIMIT 1 BY` and can't use the bloom filter indexes. That's fine at low
+  cardinality. With many series per day, a second view could take the filter as a parameter
+  and apply it before `LIMIT 1 BY`, or the query could read the table directly with a `Date`
+  condition.
+- **Backfills older than the window.** Data points more than `maxDataPointAge` old are
+  rejected. Importing history would need a separate path that inserts it in batches of fewer
+  than 100 days, not the shared ingest batches.
 - **Cardinality protection.** A per-tenant or per-metric limit on new series per day, using
   the `series.cache.lookups{result=miss}` signal that already exists.
 - **Rollups.** Materialized views into per-minute or per-hour aggregates for long-range queries.

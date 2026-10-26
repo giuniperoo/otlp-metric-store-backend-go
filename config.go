@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"dash0.com/otlp-metric-store-backend/internal/ingest"
+	"dash0.com/otlp-metric-store-backend/internal/mapping"
 	"dash0.com/otlp-metric-store-backend/internal/storage"
 	"dash0.com/otlp-metric-store-backend/internal/telemetry"
 )
@@ -25,6 +26,9 @@ type config struct {
 
 	Writer          ingest.Config
 	SeriesCacheSize int
+	// TimeLimits bound the accepted data point times. RetentionDays is copied from the
+	// retention, so that data points the TTL would delete right away are rejected.
+	TimeLimits mapping.TimeLimits
 
 	Telemetry telemetry.Config
 }
@@ -65,6 +69,8 @@ func loadConfig(args []string, getenv func(string) string) (config, error) {
 	fs.IntVar(&writer.FlushWorkers, "flushWorkers", writer.FlushWorkers, "Batches stored concurrently")
 	fs.DurationVar(&writer.FlushTimeout, "flushTimeout", writer.FlushTimeout, "Timeout for storing one batch")
 	fs.IntVar(&cfg.SeriesCacheSize, "seriesCacheSize", 1_000_000, "Series lookup rows remembered as written (0 disables the cache)")
+	fs.DurationVar(&cfg.TimeLimits.MaxAge, "maxDataPointAge", 7*24*time.Hour, "Oldest accepted data point, relative to the time of the request; older ones are rejected")
+	fs.DurationVar(&cfg.TimeLimits.MaxClockSkew, "maxClockSkew", time.Hour, "Furthest accepted data point in the future, for clients whose clocks run ahead")
 
 	fs.StringVar(&exporter, "telemetryExporter", defaultExporter, "Where to send the service's own traces, metrics and logs: otlp, stdout or none (default otlp if OTEL_EXPORTER_OTLP_ENDPOINT is set)")
 	fs.StringVar(&logLevel, "logLevel", "info", "Log level: debug, info, warn or error")
@@ -93,6 +99,10 @@ func loadConfig(args []string, getenv func(string) string) (config, error) {
 	}
 	if cfg.RetentionDays < 0 {
 		return config{}, fmt.Errorf("retentionDays must not be negative, got %d", cfg.RetentionDays)
+	}
+	cfg.TimeLimits.RetentionDays = cfg.RetentionDays
+	if err := cfg.TimeLimits.Validate(); err != nil {
+		return config{}, fmt.Errorf("invalid maxDataPointAge or maxClockSkew: %w", err)
 	}
 	return cfg, nil
 }
@@ -123,6 +133,8 @@ func (c config) logValue() slog.Value {
 		slog.Int("max_pending_data_points", c.Writer.MaxPendingPoints),
 		slog.Int("flush_workers", c.Writer.FlushWorkers),
 		slog.Int("series_cache_size", c.SeriesCacheSize),
+		slog.String("max_data_point_age", c.TimeLimits.MaxAge.String()),
+		slog.String("max_clock_skew", c.TimeLimits.MaxClockSkew.String()),
 		slog.String("telemetry_exporter", string(c.Telemetry.Exporter)),
 	)
 }

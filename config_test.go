@@ -46,6 +46,9 @@ func TestLoadConfigPrecedence(t *testing.T) {
 	if cfg.ClickHouse.Password != "secret" {
 		t.Error("password not read from CLICKHOUSE_PASSWORD")
 	}
+	if cfg.TimeLimits.RetentionDays != cfg.RetentionDays || cfg.TimeLimits.MaxAge != 7*24*time.Hour {
+		t.Errorf("time limits must default to 7 days and follow the retention, got %+v", cfg.TimeLimits)
+	}
 	if cfg.Telemetry.Exporter != telemetry.ExporterOTLP {
 		t.Errorf("an OTLP endpoint must select the OTLP exporter, got %q", cfg.Telemetry.Exporter)
 	}
@@ -59,6 +62,8 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		"bad env duration": {nil, map[string]string{"BATCH_MAX_DELAY": "soon"}},
 		"bad log level":    {[]string{"-logLevel=loud"}, nil},
 		"negative TTL":     {[]string{"-retentionDays=-1"}, nil},
+		"zero max age":     {[]string{"-maxDataPointAge=0"}, nil},
+		"window too long":  {[]string{"-maxDataPointAge=2160h", "-maxClockSkew=1h"}, nil},
 	} {
 		if _, err := loadConfig(tc.args, env(tc.env)); err == nil {
 			t.Errorf("%s: want an error", name)
