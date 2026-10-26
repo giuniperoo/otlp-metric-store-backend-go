@@ -74,7 +74,7 @@ func run(ctx context.Context, args []string, getenv func(string) string) (err er
 
 	select {
 	case <-ctx.Done():
-		logger.Info("Shutting down", slog.Duration("timeout", cfg.ShutdownTimeout))
+		logger.Info("Shutting down", slog.String("timeout", cfg.ShutdownTimeout.String()))
 	case err = <-serveErr:
 		logger.Error("gRPC server stopped", slog.Any("error", err))
 	}

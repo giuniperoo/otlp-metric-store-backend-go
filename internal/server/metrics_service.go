@@ -74,7 +74,7 @@ func (s *MetricsService) Export(ctx context.Context, req *colmetricspb.ExportMet
 		attribute.Int("otlp.metrics", res.Metrics),
 		attribute.Int("otlp.data_points", res.DataPoints),
 		attribute.Int64("otlp.data_points.rejected", res.Rejected.Total()),
-		attribute.Int("metric_store.series.new", len(res.NewSeries)),
+		attribute.Int("series.new", len(res.NewSeries)),
 	)
 
 	if err := s.writer.Write(ctx, res.NewSeries, res.Points); err != nil {

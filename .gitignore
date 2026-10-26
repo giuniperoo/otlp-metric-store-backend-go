@@ -1,1 +1,2 @@
-otlp-log-processor-backend
+/otlp-metric-store-backend
+/loadgen

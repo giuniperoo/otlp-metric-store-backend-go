@@ -1,0 +1,33 @@
+# Local stack: ClickHouse and the service.
+#   docker compose up --build
+#   go run ./tools/loadgen -duration 10s
+# To send the service's own telemetry to Dash0 or a collector, set OTEL_EXPORTER_OTLP_ENDPOINT
+# (and OTEL_EXPORTER_OTLP_HEADERS) on the otlp-metric-store service.
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.2
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: dev
+    ports:
+      - "9000:9000" # native protocol
+      - "8123:8123" # HTTP, for clickhouse-client or the web UI at /play
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--password", "dev", "--query", "SELECT 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  otlp-metric-store:
+    build: .
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_ADDR: clickhouse:9000
+      CLICKHOUSE_PASSWORD: dev
+      TELEMETRY_EXPORTER: none # logs only; set to stdout or otlp to see traces and metrics
+    ports:
+      - "4317:4317"
