@@ -1,4 +1,4 @@
-module dash0.com/otlp-log-processor-backend
+module dash0.com/otlp-metric-store-backend
 
 go 1.26
 
