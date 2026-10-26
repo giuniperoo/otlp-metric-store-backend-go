@@ -19,6 +19,8 @@ const (
 //     partitions of the days in that range, and retention drops whole partitions.
 //   - The series table is a ReplacingMergeTree ordered by the series, so the repeated rows that
 //     every ingest replica writes for an active series collapse into one row per series per day.
+//     Date leads its sorting key (it is constant within a partition, so this is free) so that
+//     time-range lookups use the primary key even without a metric name filter.
 //   - The data point table is ordered by (hour, series, time). Starting the sorting key with the
 //     hour lets the primary key prune by time even inside a day partition and even when a query
 //     filters on time only; within an hour, the points of one series are contiguous, which keeps
@@ -57,7 +59,7 @@ CREATE TABLE IF NOT EXISTS otel_metrics_series (
     INDEX idx_attr_value mapValues(Attributes) TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree
 PARTITION BY Date
-ORDER BY (MetricName, ServiceName, SeriesId)
+ORDER BY (Date, MetricName, ServiceName, SeriesId)
 {{TTL}}
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1
 `
