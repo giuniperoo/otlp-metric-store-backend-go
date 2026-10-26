@@ -117,7 +117,7 @@ func (c config) logValue() slog.Value {
 		slog.Bool("migrate", c.Migrate),
 		slog.Int("retention_days", c.RetentionDays),
 		slog.Int("batch_max_data_points", c.Writer.MaxBatchPoints),
-		slog.Duration("batch_max_delay", c.Writer.MaxBatchDelay),
+		slog.String("batch_max_delay", c.Writer.MaxBatchDelay.String()),
 		slog.Int("write_queue_size", c.Writer.QueueSize),
 		slog.Int("flush_workers", c.Writer.FlushWorkers),
 		slog.Int("series_cache_size", c.SeriesCacheSize),

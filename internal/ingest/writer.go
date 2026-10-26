@@ -269,8 +269,13 @@ func (w *Writer) flush(b *batch) {
 			attribute.Int("ingest.batch.data_points", len(b.points)),
 		))
 	defer span.End()
+	// The context is cancelled when the timeout expires, not as soon as the inserts return:
+	// clickhouse-go (v2.43) watches the context of a finished insert in a goroutine that can
+	// still observe the cancellation after the connection went back to the pool, and then
+	// closes the TCP connection under the next insert ("use of closed network connection").
+	// Found under load; letting the context expire later avoids the race.
 	ctx, cancel := context.WithTimeout(ctx, w.cfg.FlushTimeout)
-	defer cancel()
+	time.AfterFunc(w.cfg.FlushTimeout, cancel)
 
 	start := time.Now()
 	w.tel.batchWait.Record(ctx, start.Sub(b.started).Seconds())
@@ -287,7 +292,7 @@ func (w *Writer) flush(b *batch) {
 			slog.Int("requests", len(b.requests)),
 			slog.Int("series", len(b.series)),
 			slog.Int("data_points", len(b.points)),
-			slog.Duration("duration", elapsed))
+			slog.String("duration", elapsed.String()))
 	} else {
 		w.tel.seriesWritten.Add(ctx, int64(len(b.series)))
 		w.tel.pointsWritten.Add(ctx, int64(len(b.points)))
@@ -295,7 +300,7 @@ func (w *Writer) flush(b *batch) {
 			slog.Int("requests", len(b.requests)),
 			slog.Int("series", len(b.series)),
 			slog.Int("data_points", len(b.points)),
-			slog.Duration("duration", elapsed))
+			slog.String("duration", elapsed.String()))
 	}
 	w.tel.flushDuration.Record(ctx, elapsed.Seconds(), metric.WithAttributes(telemetry.Outcome(outcome)))
 	w.tel.batchSize.Record(ctx, int64(len(b.points)), metric.WithAttributes(telemetry.Outcome(outcome)))

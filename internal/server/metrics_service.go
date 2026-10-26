@@ -109,8 +109,9 @@ func (s *MetricsService) statusFor(ctx context.Context, err error, points int) (
 	case errors.Is(err, context.Canceled):
 		return telemetry.OutcomeError, status.New(codes.Canceled, "request canceled before data points were stored")
 	default:
-		// The writer already logged the storage error with its batch; keep this one short.
-		s.log.WarnContext(ctx, "Failed export: storing data points failed", slog.Any("error", err), slog.Int("data_points", points))
+		// The writer logs the storage error once per batch at error level; logging it again for
+		// every request of the batch would multiply each failure by the batch's request count.
+		s.log.DebugContext(ctx, "Failed export: storing data points failed", slog.Any("error", err), slog.Int("data_points", points))
 		return telemetry.OutcomeError, retryable("storing data points failed, retry later")
 	}
 }
