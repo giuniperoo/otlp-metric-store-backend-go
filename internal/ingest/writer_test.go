@@ -61,7 +61,7 @@ func (f *fakeStore) snapshot() (calls []string, nSeries, nPoints int) {
 }
 
 func testConfig() Config {
-	return Config{MaxBatchPoints: 1000, MaxBatchDelay: 20 * time.Millisecond, QueueSize: 100, FlushWorkers: 1, FlushTimeout: time.Second}
+	return Config{MaxBatchPoints: 1000, MaxBatchDelay: 20 * time.Millisecond, QueueSize: 100, MaxPendingPoints: 100_000, FlushWorkers: 1, FlushTimeout: time.Second}
 }
 
 func newTestWriter(t *testing.T, cfg Config, store storage.Store, cache *series.Cache) *Writer {
@@ -186,6 +186,33 @@ func TestWriterRejectsWhenQueueIsFull(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("only %d of 10 requests were rejected with ErrOverloaded, want 6", overloaded)
 		}
+	}
+}
+
+func TestWriterBoundsPendingDataPoints(t *testing.T) {
+	store := &fakeStore{block: make(chan struct{})}
+	cfg := testConfig()
+	cfg.MaxPendingPoints = 100
+	w := newTestWriter(t, cfg, store, nil)
+
+	// An oversized request is admitted when nothing is pending, so it can never starve.
+	first := make(chan error, 1)
+	go func() { first <- w.Write(context.Background(), nil, points(1, 150)) }()
+	for w.pendingPoints() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if err := w.Write(context.Background(), nil, points(2, 1)); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("got %v, want ErrOverloaded while 150 of 100 data points are pending", err)
+	}
+	close(store.block)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if n := w.pendingPoints(); n != 0 {
+		t.Fatalf("%d data points still counted as pending after the flush", n)
+	}
+	if err := w.Write(context.Background(), nil, points(3, 50)); err != nil {
+		t.Fatalf("room must be released after a flush: %v", err)
 	}
 }
 

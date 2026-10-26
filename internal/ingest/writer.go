@@ -10,9 +10,10 @@
 // stored, so a successful export response means the data is in ClickHouse. If a request fails
 // or times out, the client retries it, which can store its data points twice.
 //
-// Backpressure: the number of requests waiting for a batch is bounded by QueueSize. When the
-// queue is full, Write fails immediately with ErrOverloaded instead of piling up memory; the
-// server turns that into a retryable gRPC status, so OTLP clients back off and retry.
+// Backpressure: memory is bounded by MaxPendingPoints, the data points accepted but not yet
+// stored, and by QueueSize, the requests waiting to be added to a batch. When either is
+// reached, Write fails immediately with ErrOverloaded instead of piling up memory; the server
+// turns that into a retryable gRPC status, so OTLP clients back off and retry.
 package ingest
 
 import (
@@ -21,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -50,6 +52,10 @@ type Config struct {
 	MaxBatchDelay time.Duration
 	// QueueSize is the number of requests that may wait to be added to a batch.
 	QueueSize int
+	// MaxPendingPoints is the number of data points that may be accepted but not yet stored.
+	// It bounds memory: requests are limited by count (QueueSize) and by size (this), because
+	// a single request can carry hundreds of thousands of data points.
+	MaxPendingPoints int
 	// FlushWorkers is the number of batches inserted concurrently.
 	FlushWorkers int
 	// FlushTimeout bounds the inserts of one batch.
@@ -60,16 +66,17 @@ type Config struct {
 // each table, each of up to 100k data points.
 func DefaultConfig() Config {
 	return Config{
-		MaxBatchPoints: 100_000,
-		MaxBatchDelay:  200 * time.Millisecond,
-		QueueSize:      1_000,
-		FlushWorkers:   2,
-		FlushTimeout:   30 * time.Second,
+		MaxBatchPoints:   100_000,
+		MaxBatchDelay:    200 * time.Millisecond,
+		QueueSize:        1_000,
+		MaxPendingPoints: 2_000_000, // ~150 MB of rows
+		FlushWorkers:     2,
+		FlushTimeout:     30 * time.Second,
 	}
 }
 
 func (c Config) validate() error {
-	if c.MaxBatchPoints <= 0 || c.MaxBatchDelay <= 0 || c.QueueSize <= 0 || c.FlushWorkers <= 0 || c.FlushTimeout <= 0 {
+	if c.MaxBatchPoints <= 0 || c.MaxBatchDelay <= 0 || c.QueueSize <= 0 || c.MaxPendingPoints <= 0 || c.FlushWorkers <= 0 || c.FlushTimeout <= 0 {
 		return fmt.Errorf("ingest: all writer settings must be positive, got %+v", c)
 	}
 	return nil
@@ -85,6 +92,7 @@ type Writer struct {
 
 	mu       sync.RWMutex // guards closed and sending on requests
 	closed   bool
+	pending  atomic.Int64 // data points accepted by Write and not yet flushed
 	requests chan *request
 	batches  chan *batch
 	done     chan struct{} // closed when all batches have been flushed
@@ -144,9 +152,19 @@ func (w *Writer) Write(ctx context.Context, newSeries []storage.SeriesRow, point
 		result: make(chan error, 1),
 	}
 
+	// Reserve room for the data points. A request is always admitted when nothing is pending,
+	// so a single request larger than MaxPendingPoints can still be stored.
+	n := int64(len(points))
+	if pending := w.pending.Add(n); pending > int64(w.cfg.MaxPendingPoints) && pending != n {
+		w.pending.Add(-n)
+		w.tel.overloaded.Add(ctx, 1, metric.WithAttributes(attribute.String("limit", "pending_data_points")))
+		return ErrOverloaded
+	}
+
 	w.mu.RLock()
 	if w.closed {
 		w.mu.RUnlock()
+		w.pending.Add(-n)
 		return ErrClosed
 	}
 	select {
@@ -154,7 +172,8 @@ func (w *Writer) Write(ctx context.Context, newSeries []storage.SeriesRow, point
 		w.mu.RUnlock()
 	default:
 		w.mu.RUnlock()
-		w.tel.overloaded.Add(ctx, 1)
+		w.pending.Add(-n)
+		w.tel.overloaded.Add(ctx, 1, metric.WithAttributes(attribute.String("limit", "queue_size")))
 		return ErrOverloaded
 	}
 
@@ -305,6 +324,7 @@ func (w *Writer) flush(b *batch) {
 	w.tel.flushDuration.Record(ctx, elapsed.Seconds(), metric.WithAttributes(telemetry.Outcome(outcome)))
 	w.tel.batchSize.Record(ctx, int64(len(b.points)), metric.WithAttributes(telemetry.Outcome(outcome)))
 
+	w.pending.Add(-int64(len(b.points)))
 	for _, r := range b.requests {
 		r.result <- err
 	}
@@ -331,4 +351,9 @@ var tracer = otel.Tracer(telemetry.ScopeName + "/internal/ingest")
 // queueLength is read by the queue length gauge.
 func (w *Writer) queueLength() int64 {
 	return int64(len(w.requests))
+}
+
+// pendingPoints is read by the pending data points gauge.
+func (w *Writer) pendingPoints() int64 {
+	return w.pending.Load()
 }

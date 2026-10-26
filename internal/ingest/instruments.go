@@ -30,7 +30,7 @@ func newInstruments(w *Writer) (instruments, error) {
 	tel.pointsWritten = b.Counter("data_points.written", "{data_point}",
 		"Data points written to ClickHouse")
 	tel.overloaded = b.Counter("ingest.overloaded", "{request}",
-		"Export requests rejected because the write queue was full")
+		"Export requests rejected by backpressure, by the limit reached (queue_size, pending_data_points)")
 	tel.batches = b.Counter("ingest.batches", "{batch}",
 		"Batches handed to flush workers, by the reason the batch was closed (size, delay, shutdown)")
 	tel.flushDuration = b.Histogram("ingest.flush.duration", "s",
@@ -45,6 +45,9 @@ func newInstruments(w *Writer) (instruments, error) {
 	b.Gauge("ingest.queue.length", "{request}",
 		"Export requests waiting to be added to a batch",
 		func(context.Context) int64 { return w.queueLength() })
+	b.Gauge("ingest.pending.data_points", "{data_point}",
+		"Data points accepted and not yet stored",
+		func(context.Context) int64 { return w.pendingPoints() })
 	b.Gauge("series.cache.size", "{series}",
 		"Series lookup rows remembered as written",
 		func(context.Context) int64 { return int64(w.cache.Len()) })

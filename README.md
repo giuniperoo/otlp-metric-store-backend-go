@@ -218,10 +218,13 @@ The task says data is always queried for a time range, with no other mandatory f
   written. With a warm cache, series rows are only built and written for new series. Lookups
   for a whole request take one lock. Losing the cache (restart, second replica) only causes
   duplicate series rows, which the ReplacingMergeTree merges.
-- **Backpressure.** The queue of requests waiting for a batch is bounded. When it is full,
-  `Export` fails at once with `UNAVAILABLE` and a `RetryInfo`. OTLP exporters treat that as
-  retryable and back off, instead of the service buffering without limit until it runs out of
-  memory.
+- **Backpressure.** Memory is bounded by data, not only by request count. At most 2 million
+  data points may be accepted and not yet stored, about 150 MB of rows (a single request can
+  carry hundreds of thousands), and at most 1,000 requests may wait for a batch. When either
+  limit is reached, `Export` fails at once with `UNAVAILABLE` and a `RetryInfo`. OTLP
+  exporters treat that as retryable and back off, instead of the service buffering until it
+  runs out of memory. A request is always admitted when nothing is pending, so an oversized
+  request can't be rejected forever.
 
 ### Responses
 
@@ -255,6 +258,7 @@ environment variables.
 | `-batchMaxDataPoints` | 100000 | |
 | `-batchMaxDelay` | 200ms | upper bound on the latency batching adds |
 | `-writeQueueSize` | 1000 | requests waiting for a batch before new ones get `UNAVAILABLE` |
+| `-maxPendingDataPoints` | 2000000 | data points accepted but not yet stored before new requests get `UNAVAILABLE`; bounds memory |
 | `-flushWorkers` | 2 | batches stored concurrently |
 | `-flushTimeout` | 30s | |
 | `-seriesCacheSize` | 1000000 | (series, day) rows remembered; 0 disables the cache |
@@ -278,8 +282,8 @@ The service's own telemetry honours the standard `OTEL_*` variables (`OTEL_EXPOR
 | `data_points.written`, `series.written` | | What reached ClickHouse |
 | `series.cache.lookups` | `result`: hit, miss | Is the cache working, and how many new series appear? (A miss storm means a cardinality explosion.) |
 | `series.cache.size` | | Cache memory |
-| `ingest.queue.length` | | Saturation: approaching `writeQueueSize` means rejections are imminent |
-| `ingest.overloaded` | | Requests rejected by backpressure |
+| `ingest.queue.length`, `ingest.pending.data_points` | | Saturation: approaching `writeQueueSize` or `maxPendingDataPoints` means rejections are imminent |
+| `ingest.overloaded` | `limit`: queue_size, pending_data_points | Requests rejected by backpressure, and which limit was reached |
 | `ingest.batches` | `reason`: size, delay, shutdown | Batches mostly closing on `size` means `batchMaxDataPoints` is the limit |
 | `ingest.batch.size`, `ingest.batch.wait`, `ingest.flush.duration` | `outcome` | Insert sizes and latency, ClickHouse health |
 
@@ -313,7 +317,7 @@ missing columns, instead of every insert failing later.
 |---|---|
 | `internal/series` tests | series IDs are deterministic, ignore attribute order, change with every identity field (all 15 cases), don't change with the description, match the stored maps for duplicate keys; the cache stays bounded and keeps active series |
 | `internal/mapping` tests | gauge and sum mapping, one series row per series and day, cached series skipped, resource changes create new series, every rejection reason counted |
-| `internal/ingest` tests | series stored before data points, concurrent requests merged into one insert, full batches flushed without waiting, store errors reported to every waiting request and failed series not cached, backpressure, context deadlines, flush on close (run with `-race`) |
+| `internal/ingest` tests | series stored before data points, concurrent requests merged into one insert, full batches flushed without waiting, store errors reported to every waiting request and failed series not cached, backpressure by queue size and by pending data points, context deadlines, flush on close (run with `-race`) |
 | `internal/server` tests | partial success, status codes and `RetryInfo` per failure, internal errors not leaked to clients |
 | integration tests (`-tags integration`) | the full service against ClickHouse 26.2: migration (idempotent, detects incompatible tables, TTL), series written once despite repeated exports, idempotent across restarts, exact round trip of nanosecond timestamps, values and flags, partial success end to end, and **every documented query passing `force_index_by_date` + `force_primary_key`** |
 
@@ -325,7 +329,7 @@ same machine, so they share the CPUs. Read these as lower bounds.
 - **Mapping:** about 420 ns per data point, 36 allocations per 10,000-point request
   (`go test -bench . ./internal/mapping`). One core maps about 2.4 million data points a
   second.
-- **End to end:** about **430,000 data points per second** (64 concurrent exporters, 5,000
+- **End to end:** **380,000–450,000 data points per second** across runs (64 concurrent exporters, 5,000
   data points per request, `tools/loadgen`) with no errors. Latency p50 is 0.67 s; it is
   dominated by queueing on the saturated CPUs plus the batch window.
 - **Storage:** 26 million data points took **2.6 bytes per data point** including the series

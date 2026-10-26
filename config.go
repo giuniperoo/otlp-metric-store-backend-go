@@ -61,6 +61,7 @@ func loadConfig(args []string, getenv func(string) string) (config, error) {
 	fs.IntVar(&writer.MaxBatchPoints, "batchMaxDataPoints", writer.MaxBatchPoints, "Data points at which a batch is stored")
 	fs.DurationVar(&writer.MaxBatchDelay, "batchMaxDelay", writer.MaxBatchDelay, "Longest time a request waits for its batch to fill up")
 	fs.IntVar(&writer.QueueSize, "writeQueueSize", writer.QueueSize, "Export requests that may wait for a batch before new ones are rejected as overloaded")
+	fs.IntVar(&writer.MaxPendingPoints, "maxPendingDataPoints", writer.MaxPendingPoints, "Data points accepted but not yet stored before new requests are rejected as overloaded (bounds memory)")
 	fs.IntVar(&writer.FlushWorkers, "flushWorkers", writer.FlushWorkers, "Batches stored concurrently")
 	fs.DurationVar(&writer.FlushTimeout, "flushTimeout", writer.FlushTimeout, "Timeout for storing one batch")
 	fs.IntVar(&cfg.SeriesCacheSize, "seriesCacheSize", 1_000_000, "Series lookup rows remembered as written (0 disables the cache)")
@@ -119,6 +120,7 @@ func (c config) logValue() slog.Value {
 		slog.Int("batch_max_data_points", c.Writer.MaxBatchPoints),
 		slog.String("batch_max_delay", c.Writer.MaxBatchDelay.String()),
 		slog.Int("write_queue_size", c.Writer.QueueSize),
+		slog.Int("max_pending_data_points", c.Writer.MaxPendingPoints),
 		slog.Int("flush_workers", c.Writer.FlushWorkers),
 		slog.Int("series_cache_size", c.SeriesCacheSize),
 		slog.String("telemetry_exporter", string(c.Telemetry.Exporter)),
